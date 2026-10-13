@@ -125,13 +125,26 @@ function parseTimestampToMs(str) {
 const LIVE_WINDOW_MS = 30000;
 
 const chartCanvas = document.getElementById('chart');
+
+// Tooltip anchored at the mouse pointer rather than at a data point. The
+// default positioner follows the line(s), so while tracing along a
+// fluctuating trace the popup jumps up and down with the data and is hard
+// to read; anchoring it to the cursor keeps it steady as you move.
+Chart.Tooltip.positioners.cursor = function (items, eventPosition) {
+  return eventPosition || false;
+};
+
 let chart = new Chart(chartCanvas, {
   type: 'line',
   data: { datasets: [
-    { label: 'Current (mA)', data: [], borderColor: '#f0a860', borderWidth: 1.3,
-      pointRadius: 0, tension: 0, parsing: false, yAxisID: 'y' },
-    { label: 'Voltage (mV)', data: [], borderColor: '#6fa8dc', borderWidth: 1.3,
-      pointRadius: 0, tension: 0, parsing: false, yAxisID: 'y1' }
+    { label: 'Current (mA)', data: [], borderColor: '#f0a860', backgroundColor: '#f0a860', borderWidth: 1.3,
+      pointRadius: 0, pointHoverRadius: 5, pointHoverBackgroundColor: '#f0a860',
+      pointHoverBorderColor: '#ffffff', pointHoverBorderWidth: 1.5,
+      tension: 0, parsing: false, yAxisID: 'y' },
+    { label: 'Voltage (mV)', data: [], borderColor: '#6fa8dc', backgroundColor: '#6fa8dc', borderWidth: 1.3,
+      pointRadius: 0, pointHoverRadius: 5, pointHoverBackgroundColor: '#6fa8dc',
+      pointHoverBorderColor: '#ffffff', pointHoverBorderWidth: 1.5,
+      tension: 0, parsing: false, yAxisID: 'y1' }
   ] },
   options: {
     animation: false,
@@ -144,7 +157,26 @@ let chart = new Chart(chartCanvas, {
       y1: { position: 'right', min: 0, title: { display: true, text: 'mV', color: '#6fa8dc' },
             ticks: { color: '#6fa8dc' }, grid: { drawOnChartArea: false } }
     },
-    plugins: { legend: { display: true, labels: { color: '#8b909a', boxWidth: 14, font: { size: 11 } } } },
+    // Find the sample nearest the mouse in x, wherever the cursor is in the
+    // plot (not only when it's directly on a line), and highlight/report
+    // BOTH series at that sample. Drives the hover dots and the popup alike.
+    interaction: { mode: 'index', intersect: false, axis: 'x' },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b909a', boxWidth: 14, font: { size: 11 } } },
+      tooltip: {
+        mode: 'index', intersect: false, position: 'cursor',
+        animation: { duration: 0 },
+        backgroundColor: 'rgba(20,22,26,0.92)', borderColor: '#2c3038', borderWidth: 1,
+        titleColor: '#e8e9eb', bodyColor: '#e8e9eb',
+        padding: 8, caretPadding: 12, boxPadding: 3,
+        callbacks: {
+          title: items => items.length ? `${items[0].parsed.x.toFixed(3)} s` : '',
+          label: ctx => ctx.datasetIndex === 0
+            ? ` Current: ${ctx.parsed.y.toFixed(2)} mA`
+            : ` Voltage: ${ctx.parsed.y.toFixed(1)} mV`
+        }
+      }
+    },
     onClick: onChartClick,
     onHover: onChartHover
   },

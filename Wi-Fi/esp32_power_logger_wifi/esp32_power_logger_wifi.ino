@@ -32,9 +32,13 @@
   brief dip (the monitored device rebooting, say) just pauses logging
   into the same still-open file; if current comes back up within the
   grace window, logging resumes with no new file and no new EVENT,WAKE.
-  SAMPLE's <active> flag reflects whether that exact sample was written
-  to the file, so it will read 0 during a sleep-pending gap even before
-  the capture is actually finalized.
+  SAMPLE's <active> flag is the true active state (above-threshold, not
+  paused in a sleep-pending gap), so it reads 0 during a sleep-pending gap
+  even before the capture is actually finalized.
+
+  Saved capture files also include PREROLL_MS of context before the wake
+  and POSTROLL_MS after activity drops off, written with active=0, so the
+  ramp up and down are visible either side of the true active span.
 
   HTTP API (port 80), all responses include CORS headers so
   power_monitor.html can call them when opened as a local file:
@@ -125,6 +129,35 @@ const uint32_t SLEEP_GRACE_MS = 60000;
 // DIAG_FLUSH_TIMING/flush_log.csv), and 20 Hz specifically also halves
 // wake/sleep debounce latency versus 10 Hz (see DEBOUNCE_SAMPLES above).
 const uint32_t SAMPLE_INTERVAL_MS = 50;
+
+// ---- Pre-roll / post-roll context around each capture ----
+// Each saved capture also includes a little context either side of the
+// actual above-threshold activity, to help visualise the full capture
+// (the ramp up from idle, and the ramp back down) rather than a trace
+// that starts and stops abruptly at the threshold crossings.
+//   - Pre-roll: the last PREROLL_MS of samples from *before* wake was
+//     confirmed, kept in a small always-running ring buffer.
+//   - Post-roll: the first POSTROLL_MS of samples after current drops
+//     below threshold, written before logging pauses into the sleep-
+//     pending gap (see SLEEP_GRACE_MS).
+// Context rows are written with active=0 (they weren't above threshold),
+// so the viewer's shaded "active" region still marks only the true active
+// span, with this context visible just outside it. Both are expressed in
+// wall-clock time and converted to sample counts via SAMPLE_INTERVAL_MS,
+// so they stay correct if the sample rate is tuned again.
+const uint32_t PREROLL_MS  = 2000;
+const uint32_t POSTROLL_MS = 2000;
+const uint16_t PREROLL_SAMPLES = PREROLL_MS / SAMPLE_INTERVAL_MS;
+
+struct RecentSample {
+  uint64_t wallMs;
+  float voltage_mV;
+  float current_mA;
+  float power_mW;
+};
+RecentSample prerollBuf[PREROLL_SAMPLES];
+uint16_t prerollWriteIdx = 0;
+uint16_t prerollCount = 0; // valid entries so far (less than PREROLL_SAMPLES until the buffer first fills)
 
 // ---- On-device storage ----
 // Keep at least this many bytes free at all times; if a capture close
@@ -352,10 +385,13 @@ void startCaptureFile(uint64_t wallMs) {
 // allocation/erase that LittleFS.open() alone doesn't incur.
 const uint32_t SLOW_WRITE_THRESHOLD_MS = 15;
 
-void writeSampleToCapture(const char* timestamp, float voltage_mV, float current_mA, float power_mW) {
+// activeFlag goes in the CSV's "active" column: 1 for a sample taken while
+// genuinely in the active state, 0 for pre-roll/post-roll context rows
+// written just outside it (see PREROLL_MS / POSTROLL_MS).
+void writeSampleToCapture(const char* timestamp, float voltage_mV, float current_mA, float power_mW, bool activeFlag) {
   if (!captureFile) return;
   uint32_t tw0 = DIAG_FLUSH_TIMING ? millis() : 0;
-  captureFile.printf("%s,%.1f,%.3f,%.3f,1\n", timestamp, voltage_mV, current_mA, power_mW);
+  captureFile.printf("%s,%.1f,%.3f,%.3f,%d\n", timestamp, voltage_mV, current_mA, power_mW, activeFlag ? 1 : 0);
   if (DIAG_FLUSH_TIMING) {
     uint32_t writeMs = millis() - tw0;
     if (writeMs > SLOW_WRITE_THRESHOLD_MS) {
@@ -377,6 +413,34 @@ void writeSampleToCapture(const char* timestamp, float voltage_mV, float current
       diagLog(diagLine);
     }
     samplesSinceFlush = 0;
+  }
+}
+
+// Records every sample into the always-running pre-roll ring buffer,
+// regardless of capture state, so the last PREROLL_MS of history is
+// always available the moment a wake is confirmed.
+void prerollPush(uint64_t wallMs, float voltage_mV, float current_mA, float power_mW) {
+  prerollBuf[prerollWriteIdx] = { wallMs, voltage_mV, current_mA, power_mW };
+  prerollWriteIdx = (prerollWriteIdx + 1) % PREROLL_SAMPLES;
+  if (prerollCount < PREROLL_SAMPLES) prerollCount++;
+}
+
+// Writes the buffered pre-wake context into the just-opened capture file,
+// oldest first. Skips the buffer's newest entry: that's the sample which
+// just confirmed the wake, and the normal active-write path in loop()
+// writes it separately right afterward — dumping it here too would
+// duplicate that row.
+void writePrerollToCapture() {
+  if (prerollCount <= 1) return;
+  uint16_t entriesToWrite = prerollCount - 1;
+  // Oldest entry sits at prerollWriteIdx once the buffer has wrapped, or
+  // at index 0 if it hasn't filled yet.
+  uint16_t oldestIdx = (prerollCount < PREROLL_SAMPLES) ? 0 : prerollWriteIdx;
+  for (uint16_t k = 0; k < entriesToWrite; k++) {
+    const RecentSample& s = prerollBuf[(oldestIdx + k) % PREROLL_SAMPLES];
+    char tsBuf[32];
+    formatTimestamp(s.wallMs, tsBuf, sizeof(tsBuf));
+    writeSampleToCapture(tsBuf, s.voltage_mV, s.current_mA, s.power_mW, false);
   }
 }
 
@@ -538,6 +602,11 @@ void loop() {
   float power_mW      = busVoltage_V * current_mA; // more stable than getPower_mW() derived value at low currents
   float voltage_mV    = busVoltage_V * 1000.0;
 
+  // Always record into the pre-roll ring buffer first, whatever the capture
+  // state — by the time a wake is confirmed below, it already holds the
+  // preceding PREROLL_MS of history (and this sample as its newest entry).
+  prerollPush(wallMs, voltage_mV, current_mA, power_mW);
+
   // ---- Hysteresis + debounce wake/sleep detection, with a long-tail grace
   // period before a capture is actually finalized (see SLEEP_GRACE_MS) ----
   bool instantAboveWake  = current_mA > WAKE_THRESHOLD_MA;
@@ -551,7 +620,16 @@ void loop() {
           captureState = CAP_ACTIVE;
           wakeStartMs = now;
           debounceCount = 0;
-          startCaptureFile(wallMs);
+          // Name the file after its true first row — the oldest pre-roll
+          // sample — so the filename's timestamp still matches the file's
+          // first data row now that pre-roll starts it ahead of the wake.
+          uint64_t fileStartMs = wallMs;
+          if (prerollCount > 1) {
+            uint16_t oldestIdx = (prerollCount < PREROLL_SAMPLES) ? 0 : prerollWriteIdx;
+            fileStartMs = prerollBuf[oldestIdx].wallMs;
+          }
+          startCaptureFile(fileStartMs);
+          writePrerollToCapture();
           char buf[48];
           snprintf(buf, sizeof(buf), "EVENT,WAKE,%s", tsBuf);
           webSocket.broadcastTXT(buf);
@@ -600,15 +678,22 @@ void loop() {
       break;
   }
 
-  // ---- Save to flash only while actively logging (not during a sleep-pending gap) ----
-  bool loggingNow = (captureState == CAP_ACTIVE);
-  if (loggingNow) {
-    writeSampleToCapture(tsBuf, voltage_mV, current_mA, power_mW);
+  // ---- Save to flash while actively logging, plus the first POSTROLL_MS
+  // after dropping below threshold (post-roll context), but not the rest of
+  // a sleep-pending gap ----
+  bool isActive = (captureState == CAP_ACTIVE);
+  bool inPostroll = (captureState == CAP_SLEEP_PENDING) && ((now - sleepPendingStartMs) < POSTROLL_MS);
+  if (isActive || inPostroll) {
+    // Post-roll rows go in with active=0: they're context, not part of the
+    // true above-threshold span.
+    writeSampleToCapture(tsBuf, voltage_mV, current_mA, power_mW, isActive);
   }
 
-  // ---- Always stream the sample over Wi-Fi too, regardless of logging state ----
+  // ---- Always stream the sample over Wi-Fi too, regardless of logging state.
+  // The active flag here is the true active state, not "was written to file",
+  // so live shading marks only the genuine above-threshold span. ----
   char line[96];
   snprintf(line, sizeof(line), "SAMPLE,%s,%.1f,%.3f,%.3f,%d",
-           tsBuf, voltage_mV, current_mA, power_mW, loggingNow ? 1 : 0);
+           tsBuf, voltage_mV, current_mA, power_mW, isActive ? 1 : 0);
   webSocket.broadcastTXT(line);
 }
