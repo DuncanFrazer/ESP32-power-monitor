@@ -45,8 +45,9 @@
     GET    /files            -> JSON array of {"name":..,"size":..}
     GET    /download?file=X  -> returns the file's CSV content
     DELETE /delete?file=X    -> removes the file from flash
-  /flush_log.csv (see DIAG_FLUSH_TIMING below) isn't a capture file, so it
-  won't appear in /files, but it's still fetchable directly:
+  /flush_log.csv and /flush_log_prev.csv (the log rotates when it grows
+  past DIAG_LOG_MAX_BYTES) aren't capture files, so they won't appear in
+  /files, but they're still fetchable directly:
   /download?file=flush_log.csv
 
   --- HARDWARE (this variant) ---
@@ -93,6 +94,7 @@
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <esp_system.h>
 #include <sys/time.h>
 #include <INA226_WE.h>
 #include "secrets.h"   // copy secrets_example.h -> secrets.h and fill in your credentials
@@ -116,19 +118,26 @@ const uint32_t SERIAL_WAIT_MS = 3000;
 //   shunt non-zero, current small -> SHUNT_OHMS doesn't match the module
 //   shunt non-zero, current exactly 0 -> calibration register not applied
 // Cheap (one extra register read per second); turn off once it's working.
-const bool SENSOR_DEBUG_SERIAL = false;
+const bool SENSOR_DEBUG_SERIAL = true;
 uint32_t lastSensorDebugMs = 0;
+const bool CLIP_NEGATIVE_CURRENT = true;
 
-// Shunt resistor on your INA226 module — VERIFY THIS on your board. Most
-// common breakouts use 0.1 ohm (marked R100); some use 0.01 ohm (R010).
-// The INA226's shunt input is +/-81.92 mV full scale, so a 0.1 ohm shunt
-// measures up to ~0.82 A, which comfortably covers this project's typical
-// active currents (a few hundred mA) with good low-current resolution
-// (~25 uA per count). A 0.01 ohm shunt would reach ~8 A but with 10x
-// coarser resolution at low currents — if that's what you have, set
-// SHUNT_OHMS = 0.01 and MAX_EXPECTED_A = 8.0.
+// Shunt resistor on your INA226 module. Yours is marked R010 = 0.010 ohm
+// (10 milliohm). Other common values: R100 = 0.1 ohm, R002 = 0.002 ohm —
+// if you ever swap modules, change SHUNT_OHMS to match, or every current
+// reading will be scaled wrongly by the ratio between the two (a 0.1 ohm
+// assumption on a 0.01 ohm shunt reads 10x too LOW).
+//
+// With 0.01 ohm the shunt input (+/-81.92 mV full scale) reaches ~8 A and
+// each count of the shunt voltage register (2.5 uV) is ~0.25 mA, which is
+// ample for this project's tens-to-hundreds of mA.
+//
+// MAX_EXPECTED_A sets the current register's scale (it saturates at this
+// value) and must be at least ~0.26 A for a 0.01 ohm shunt, or the
+// calibration value overflows its 16-bit register. 1.0 A gives ~3x headroom
+// over the largest peak seen so far (~306 mA).
 const float SHUNT_OHMS     = 0.01;
-const float MAX_EXPECTED_A = 8;
+const float MAX_EXPECTED_A = 1.0;
 
 // Hardware averaging done inside the INA226 itself, which smooths noise
 // at low currents for free. Total time per reading = 2 x conversion time
@@ -146,12 +155,12 @@ INA226_WE ina226 = INA226_WE(INA226_I2C_ADDR);
 // Some ESP32-C3 Supermini clones have antenna/regulator quirks that make
 // Wi-Fi connection flaky at full TX power. If yours won't connect reliably
 // or drops out, set this true to cap TX power.
-const bool WIFI_REDUCE_TX_POWER = false;
+const bool WIFI_REDUCE_TX_POWER = true;
 
 // ---- Wi-Fi ----
 const char* WIFI_SSID     = SECRET_WIFI_SSID;
 const char* WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
-const char* MDNS_HOSTNAME = "powerloggerc3"; // reachable at powerloggerc3.local (distinct from the original ESP32/INA219 build's powerlogger.local)
+const char* MDNS_HOSTNAME = "powerlogger"; // reachable at powerlogger.local
 const uint16_t WS_PORT    = 81;
 const uint16_t HTTP_PORT  = 80;
 
@@ -169,10 +178,10 @@ bool timeSynced = false;
 
 // ---- Detection thresholds (mA) ----
 // Wake threshold: current must exceed this to be considered "active"
-const float WAKE_THRESHOLD_MA  = 15.0;
+const float WAKE_THRESHOLD_MA  = 2.0;
 // Sleep threshold: current must drop below this to be considered "idle"
 // (kept lower than wake threshold = hysteresis, avoids chatter on noisy edges)
-const float SLEEP_THRESHOLD_MA = 10.0;
+const float SLEEP_THRESHOLD_MA = 1.0;
 // Number of consecutive samples that must agree before flipping state,
 // to reject single-sample glitches. At SAMPLE_INTERVAL_MS below, this is
 // the wake/sleep detection latency (currently 3 * 50ms = 150ms) — fine
@@ -193,7 +202,7 @@ const uint8_t DEBOUNCE_SAMPLES = 3;
 // the ESP32 running this firmware itself loses power or resets, all RAM
 // state (including the open file handle) is lost regardless of this
 // setting, and a new file will start on the next wake no matter what.
-const uint32_t SLEEP_GRACE_MS = 60000;
+const uint32_t SLEEP_GRACE_MS = 30000;
 
 // ---- Sampling ----
 // 20 Hz — this project is for observing gross wake/sleep behaviour, not
@@ -234,68 +243,306 @@ uint16_t prerollWriteIdx = 0;
 uint16_t prerollCount = 0; // valid entries so far (less than PREROLL_SAMPLES until the buffer first fills)
 
 // ---- On-device storage ----
-// Keep at least this many bytes free at all times; if a capture close
-// would leave less than this, the oldest saved capture is deleted first.
-const size_t MIN_FREE_BYTES = 20000;       // ~20KB headroom
-// How often to flush the open capture file to flash while it's being
-// written, expressed as a target wall-clock interval (not a raw sample
-// count) so it stays correct if SAMPLE_INTERVAL_MS is ever tuned again.
-// Flushing every sample is safest against power loss but wears flash
-// faster and can stall the sample loop; this balances the two.
+// Rolling retention. The goal: when a capture finishes, clean out old data
+// right then, while the device is idle, so there is room for the whole NEXT
+// capture — and nothing needs to be deleted (or flushed) while that next
+// capture is being recorded. Space reserved for the next capture is
+// CAPTURE_BUDGET_FACTOR x the largest of the last RECENT_CAPTURES_TRACKED
+// captures (so it adapts if captures get longer).
 //
-// Each flush briefly stalls sampling (measured 40-350ms+ in practice,
-// apparently growing as more capture history accumulates on the device —
-// see the DIAG_FLUSH_TIMING log below). That stall is largely a NOR flash
-// erase, which on ESP32 disables interrupts system-wide for its duration
-// -- a hardware constraint no amount of software buffering/task splitting
-// can fully hide. The practical lever is simply flushing less often:
-// fewer, larger writes means fewer erases overall, at the cost of more
-// data at risk if power is cut mid-capture (up to roughly this many
-// milliseconds of data).
+// On top of that, a FLOOR of free space (a percentage of the flash) is kept
+// for speed: LittleFS finds free blocks by traversing the whole filesystem
+// each time its allocator's look-ahead window runs dry, which happens far
+// more often when the flash is nearly full. Observed directly: keeping only
+// ~20KB free, every flush/write/open got steadily slower as the flash filled
+// (flush mean 8 -> 40 ms, capture-open 40 -> 190 ms over ~100 captures),
+// costing samples at 20 Hz. The cleanup target is whichever of the two is
+// larger. Set FREE_FLOOR_PERCENT to 0 for a purely next-capture-sized
+// reserve (more retained history, slower writes as it fills).
+const uint8_t  FREE_FLOOR_PERCENT      = 40;
+const uint8_t  CAPTURE_BUDGET_FACTOR   = 2;
+const uint8_t  RECENT_CAPTURES_TRACKED = 8;
+const size_t   MIN_CAPTURE_BUDGET_BYTES = 64000; // reserve at least this much, however small recent captures were
+const size_t   EMERGENCY_FREE_BYTES    = 64000;  // at capture START, only clean up if free space is below this
+const size_t   EXTREME_LOW_FREE_BYTES  = 32000;  // MID-capture: purge only if free space (net of this capture) falls below this
+const uint8_t  MAX_DELETES_PER_CALL    = 4;      // bounds any one stall; remaining cleanup carries on after later captures
+const uint8_t  FS_RESYNC_EVERY_N_CLOSES = 20;    // how often to re-read the exact (slow) used-bytes figure
+const size_t   FS_BLOCK_BYTES          = 4096;   // LittleFS block size on ESP32
+// FLUSHING: deliberately almost never. Each flush() stalls sampling (a flash
+// erase+program; 40-350 ms+ observed, and growing as the flash fills), so
+// captures are written straight through and only committed when they close.
+// The trade-off to be aware of: until a capture closes (or a flush happens),
+// its data is only in RAM and in not-yet-committed flash blocks, so if power
+// is lost or the chip resets mid-capture, that in-progress capture is
+// likely lost (LittleFS publishes a file's contents on sync/close). The
+// capture's start and the unfinished tail are simply gone; previously
+// closed captures are unaffected.
 //
-// Note this is a separate mechanism from LittleFS's own internal write
-// cache, which auto-commits to flash on its own schedule (observed as
-// "slow_write" entries roughly every ~4KB of data) regardless of this
-// setting — this constant only controls writeSampleToCapture()'s own
-// explicit flush() calls, not LittleFS's internal ones.
-const uint32_t FLUSH_INTERVAL_MS = 5000; // target: flush roughly every 5s of wall-clock time
-const uint16_t FLUSH_EVERY_N_SAMPLES = FLUSH_INTERVAL_MS / SAMPLE_INTERVAL_MS; // Don't raise
-                                             // FLUSH_INTERVAL_MS further until /flush_log.csv
-                                             // shows headroom below the watchdog reset risk
-                                             // noted below — see the Time sync / storage notes
-                                             // in the README.
+// The one exception — "something extreme": a single capture that stays open
+// for SAFETY_FLUSH_MS (a very long session) gets a flush, so the data at
+// risk is bounded to about that long rather than the whole thing. Expressed
+// in wall-clock time and converted to a sample count via SAMPLE_INTERVAL_MS
+// so it stays correct if the sample rate is tuned. (The other "extreme" case
+// is running short of space mid-capture; see EXTREME_LOW_FREE_BYTES.)
+//
+// Separately from all this, LittleFS auto-commits its own internal write
+// cache every ~4KB (the periodic "slow_write" entries) — that isn't
+// controllable from here.
+const uint32_t SAFETY_FLUSH_MS = 120000;
+const uint16_t FLUSH_EVERY_N_SAMPLES = SAFETY_FLUSH_MS / SAMPLE_INTERVAL_MS;
 
-// Logs how long each flush (and startCaptureFile()'s ensureFreeSpace() +
-// file-open) takes — both to Serial (for when it's being watched live) and
-// to a small persistent file, /flush_log.csv, on the device itself (for
-// when it isn't). The file survives power cycles and is downloadable the
-// same way a capture is: /download?file=flush_log.csv — it isn't a
-// capture file so it won't show up in the Device files list, but it's
-// fetchable directly. Negligible overhead; safe to leave on.
+// Diagnostic log: capture open/close timing (including what the cleanup
+// deleted and how much space is estimated free), flushes, unusually slow
+// writes, mid-capture "extreme" purges, and one row per boot including the
+// chip's reset reason. Rows are held in RAM and written to /flush_log.csv
+// only when the device is idle (end of a capture), never mid-capture. The
+// file survives power cycles and rotates to /flush_log_prev.csv when it
+// grows large. Both are downloadable like a capture —
+// /download?file=flush_log.csv — though they don't appear in the Device
+// files list since they aren't captures.
 //
-// IMPORTANT ceiling to watch for in that log: ESP32's watchdog timer will
-// reset the whole device if something blocks the CPU without yielding for
-// too long (commonly ~5s by default, though this varies by board-package
-// version) — a flash garbage-collection stall is a known way to
-// occasionally spike into multi-second territory on a filling filesystem.
-// If any duration in the log starts approaching a few seconds, that's the
-// signal to stop raising FLUSH_EVERY_N_SAMPLES further, not a Serial
-// message you'd otherwise never see.
+// Watch for any duration approaching a few seconds: ESP32's watchdog timer
+// will reset the whole device if something blocks the CPU without yielding
+// for too long (commonly ~5s by default, varying by board-package version),
+// and a flash garbage-collection stall is a known way to occasionally spike
+// that high on a filling filesystem.
 const bool DIAG_FLUSH_TIMING = true;
 const char* DIAG_LOG_PATH = "/flush_log.csv";
-const size_t DIAG_LOG_MAX_BYTES = 50000; // cap so diagnostics can't eat meaningfully into capture-data space
+const char* DIAG_LOG_PREV_PATH = "/flush_log_prev.csv";
+const size_t DIAG_LOG_MAX_BYTES = 40000; // once exceeded, the log rotates to flush_log_prev.csv (so ~2x this is kept)
+const size_t DIAG_BUF_BYTES = 3072;
+
+// ---- Capture index & cleanup (begin) ----
+// Diagnostic rows are collected in RAM and only written to flash once the
+// device is idle (end of a capture) — never mid-capture. Writing each one
+// immediately used to be the single biggest source of sampling gaps: every
+// append is itself a flash erase+program plus filesystem metadata work that
+// grows with the number of stored files (150-440 ms once ~100 captures were
+// stored), and it landed in the middle of the very capture being measured,
+// on top of whatever stall was being logged.
+char diagBuf[DIAG_BUF_BYTES];
+size_t diagBufLen = 0;
+uint16_t diagDropped = 0;
 
 void diagLog(const char* line) {
   if (!DIAG_FLUSH_TIMING) return;
-  File check = LittleFS.open(DIAG_LOG_PATH, "r");
-  bool tooBig = check && check.size() > DIAG_LOG_MAX_BYTES;
-  if (check) check.close();
-  File f = LittleFS.open(DIAG_LOG_PATH, tooBig ? "w" : "a"); // "w" truncates and starts fresh once the cap is hit
+  size_t n = strlen(line);
+  if (diagBufLen + n + 1 > DIAG_BUF_BYTES) { diagDropped++; return; } // full: drop, and say so when flushed
+  memcpy(diagBuf + diagBufLen, line, n);
+  diagBufLen += n;
+  diagBuf[diagBufLen++] = '\n';
+}
+
+// Writes the buffered rows to flash (rotating the log if it has grown past
+// its cap). Only call this when sampling stalls don't matter.
+void diagFlushToFlash() {
+  if (!DIAG_FLUSH_TIMING || diagBufLen == 0) return;
+  File f = LittleFS.open(DIAG_LOG_PATH, "a");
+  if (f && f.size() > DIAG_LOG_MAX_BYTES) {
+    f.close();
+    LittleFS.remove(DIAG_LOG_PREV_PATH);
+    LittleFS.rename(DIAG_LOG_PATH, DIAG_LOG_PREV_PATH);
+    f = LittleFS.open(DIAG_LOG_PATH, "w");
+  }
   if (f) {
-    f.println(line);
+    f.write((const uint8_t*)diagBuf, diagBufLen);
+    if (diagDropped) f.printf("diag,dropped_lines=%u\n", (unsigned)diagDropped);
     f.close();
   }
+  diagBufLen = 0;
+  diagDropped = 0;
 }
+
+// An oldest-first list of capture files held in RAM, so cleanup never has to
+// walk the directory (an O(files) scan) at capture time. Built once at boot,
+// then maintained incrementally. It tolerates stale entries — e.g. a file
+// deleted from the web page: removing a missing file just pops the entry.
+const uint16_t MAX_TRACKED_CAPTURES = 256;
+struct CaptureEntry { char name[36]; uint32_t sizeBytes; uint32_t lastWrite; };
+CaptureEntry capIndex[MAX_TRACKED_CAPTURES];
+uint16_t capHead = 0;           // position of the oldest entry
+uint16_t capCount = 0;
+size_t fsTotalBytes = 0;
+size_t fsUsedEstimate = 0;      // tracked incrementally — LittleFS.usedBytes() is a slow full traversal
+uint8_t closesSinceResync = 0;
+uint32_t bootIndexMs = 0;
+uint32_t recentCapBytes[RECENT_CAPTURES_TRACKED]; // sizes of the last few closed captures (ring)
+uint8_t recentCapPos = 0;
+size_t capBytesThisCapture = 0; // bytes written to the capture currently open
+bool extremeGaveUp = false;     // mid-capture purge found nothing left to delete
+
+size_t fsBlockRound(size_t bytes) { return ((bytes + FS_BLOCK_BYTES - 1) / FS_BLOCK_BYTES) * FS_BLOCK_BYTES; }
+size_t fsFreeEstimate() { return (fsTotalBytes > fsUsedEstimate) ? fsTotalBytes - fsUsedEstimate : 0; }
+
+void recentCaptureNote(uint32_t bytes) {
+  recentCapBytes[recentCapPos] = bytes;
+  recentCapPos = (recentCapPos + 1) % RECENT_CAPTURES_TRACKED;
+}
+size_t largestRecentCapture() {
+  uint32_t m = 0;
+  for (uint8_t i = 0; i < RECENT_CAPTURES_TRACKED; i++) if (recentCapBytes[i] > m) m = recentCapBytes[i];
+  return m;
+}
+// Space to reserve for the next capture: a multiple of the largest recent one.
+size_t nextCaptureBudgetBytes() {
+  size_t b = fsBlockRound(largestRecentCapture()) * CAPTURE_BUDGET_FACTOR;
+  if (b < MIN_CAPTURE_BUDGET_BYTES) b = MIN_CAPTURE_BUDGET_BYTES;
+  size_t cap = fsTotalBytes / 2; // never reserve more than half the flash
+  if (b > cap) b = cap;
+  return b;
+}
+// How much free space the end-of-capture cleanup aims for.
+size_t cleanupTargetBytes() {
+  size_t floorBytes = (fsTotalBytes / 100) * FREE_FLOOR_PERCENT;
+  size_t budget = nextCaptureBudgetBytes();
+  return budget > floorBytes ? budget : floorBytes;
+}
+
+// Registers a capture file that has just been created (name without leading slash).
+void capIndexPushBack(const char* nameNoSlash) {
+  if (capCount >= MAX_TRACKED_CAPTURES) return; // can't track it; cleanup still works on the entries it does hold
+  CaptureEntry& e = capIndex[(capHead + capCount) % MAX_TRACKED_CAPTURES];
+  strncpy(e.name, nameNoSlash, sizeof(e.name) - 1);
+  e.name[sizeof(e.name) - 1] = 0;
+  e.sizeBytes = 0;
+  e.lastWrite = 0;
+  capCount++;
+}
+
+// Builds the index from what's on flash (once, at boot), oldest first, and
+// seeds the "recent capture sizes" from the newest few.
+void loadCaptureIndex() {
+  capHead = 0;
+  capCount = 0;
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    String name = String(file.name());
+    if (name.startsWith("/")) name = name.substring(1);
+    if (name.startsWith("cap_") && name.endsWith(".csv") &&
+        name.length() < sizeof(capIndex[0].name) && capCount < MAX_TRACKED_CAPTURES) {
+      CaptureEntry& e = capIndex[capCount++];
+      strcpy(e.name, name.c_str());
+      e.sizeBytes = file.size();
+      e.lastWrite = (uint32_t)file.getLastWrite();
+    }
+    file = root.openNextFile();
+  }
+  // Insertion sort, oldest first (by last-write time, then name).
+  for (uint16_t i = 1; i < capCount; i++) {
+    CaptureEntry key = capIndex[i];
+    int j = (int)i - 1;
+    while (j >= 0 && (capIndex[j].lastWrite > key.lastWrite ||
+           (capIndex[j].lastWrite == key.lastWrite && strcmp(capIndex[j].name, key.name) > 0))) {
+      capIndex[j + 1] = capIndex[j];
+      j--;
+    }
+    capIndex[j + 1] = key;
+  }
+  for (uint8_t i = 0; i < RECENT_CAPTURES_TRACKED; i++) recentCapBytes[i] = 0;
+  recentCapPos = 0;
+  uint16_t seed = (capCount < RECENT_CAPTURES_TRACKED) ? capCount : RECENT_CAPTURES_TRACKED;
+  for (uint16_t i = capCount - seed; i < capCount; i++) recentCaptureNote(capIndex[(capHead + i) % MAX_TRACKED_CAPTURES].sizeBytes);
+}
+
+// Deletes the oldest tracked capture. Returns true if a file was removed.
+bool deleteOldestCapture() {
+  while (capCount > 0) {
+    CaptureEntry& e = capIndex[capHead];
+    String path = String("/") + e.name;
+    uint32_t sz = e.sizeBytes;
+    bool ok = LittleFS.remove(path);
+    capHead = (capHead + 1) % MAX_TRACKED_CAPTURES;
+    capCount--;
+    if (ok) {
+      size_t freed = fsBlockRound(sz);
+      fsUsedEstimate = (fsUsedEstimate > freed) ? fsUsedEstimate - freed : 0;
+      Serial.print("Freed space by deleting oldest capture: ");
+      Serial.println(path);
+      return true;
+    }
+    // Stale entry (the file was already gone) — carry on to the next oldest.
+  }
+  return false;
+}
+
+// Deletes oldest captures until enough is free (bounded by MAX_DELETES_PER_CALL
+// so one call can't stall sampling for long). atOpen=true is for the moment a
+// capture is about to start: the time right after a wake is the one place a
+// stall costs real data, so only clean up there if space is genuinely short
+// for the capture about to be written; otherwise (a capture just finished and
+// the device is idle) aim for the full target. Returns the number deleted.
+int ensureFreeSpace(bool atOpen) {
+  size_t goal;
+  if (atOpen) {
+    goal = fsBlockRound(largestRecentCapture());
+    if (goal < EMERGENCY_FREE_BYTES) goal = EMERGENCY_FREE_BYTES;
+  } else {
+    goal = cleanupTargetBytes();
+  }
+  int deleted = 0;
+  while (deleted < MAX_DELETES_PER_CALL && fsFreeEstimate() < goal) {
+    if (!deleteOldestCapture()) break; // nothing tracked left to delete
+    deleted++;
+  }
+  return deleted;
+}
+
+// Records a capture that has just been closed with its final size.
+void registerClosedCapture(const char* nameNoSlash, size_t sizeBytes) {
+  if (capCount > 0) {
+    CaptureEntry& last = capIndex[(capHead + capCount - 1) % MAX_TRACKED_CAPTURES];
+    if (strcmp(last.name, nameNoSlash) == 0) last.sizeBytes = sizeBytes;
+  }
+  fsUsedEstimate += fsBlockRound(sizeBytes);
+  recentCaptureNote((uint32_t)sizeBytes);
+}
+
+// Re-reads the exact used-bytes figure every FS_RESYNC_EVERY_N_CLOSES
+// captures, so drift in the running estimate (filesystem metadata overhead,
+// files deleted from the web page, the diagnostic log growing) can't
+// accumulate. It's slow, so it only runs at the end of a capture when the
+// device is idle. Returns how long it took in ms, or 0 if it wasn't due.
+uint32_t storageResyncIfDue() {
+  if (++closesSinceResync < FS_RESYNC_EVERY_N_CLOSES) return 0;
+  closesSinceResync = 0;
+  uint32_t r0 = millis();
+  fsUsedEstimate = LittleFS.usedBytes();
+  uint32_t ms = millis() - r0;
+  return ms ? ms : 1;
+}
+
+// ---- Mid-capture space guard ("something extreme") ----
+void resetCaptureSpaceTracking() {
+  capBytesThisCapture = 0;
+  extremeGaveUp = false;
+}
+// Free space as it is right now: the running estimate doesn't include the
+// capture that's still open, so subtract what it has written so far.
+size_t fsFreeNetOfOpenCapture() {
+  size_t open = fsBlockRound(capBytesThisCapture);
+  size_t f = fsFreeEstimate();
+  return f > open ? f - open : 0;
+}
+// Called when the open capture has eaten into the last of the free space (it
+// is far bigger than anything recent). Purges the oldest captures NOW — a
+// one-off stall, accepted because the alternative is writes failing — and
+// logs it. Returns the number deleted.
+int extremeSpaceGuard(const char* tsForLog) {
+  if (extremeGaveUp) return 0;
+  int deleted = 0;
+  while (deleted < MAX_DELETES_PER_CALL && fsFreeNetOfOpenCapture() < EXTREME_LOW_FREE_BYTES * 2) {
+    if (!deleteOldestCapture()) { extremeGaveUp = true; break; }
+    deleted++;
+  }
+  char line[200];
+  snprintf(line, sizeof(line), "%s,extreme,reason=low_free,deleted=%d,free_net_kb=%u,capture_kb=%u,gave_up=%d",
+           tsForLog, deleted, (unsigned)(fsFreeNetOfOpenCapture() / 1024), (unsigned)(capBytesThisCapture / 1024), extremeGaveUp ? 1 : 0);
+  Serial.println(line);
+  diagLog(line);
+  return deleted;
+}
+// ---- Capture index & cleanup (end) ----
 
 enum CaptureState { CAP_IDLE, CAP_ACTIVE, CAP_SLEEP_PENDING };
 CaptureState captureState = CAP_IDLE;
@@ -361,57 +608,9 @@ void addCorsHeaders() {
   httpServer.sendHeader("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS");
 }
 
-// Deletes the oldest /cap_*.csv file. Returns true if a file was deleted.
-bool deleteOldestCapture() {
-  File root = LittleFS.open("/");
-  File file = root.openNextFile();
-  String oldestName;
-  time_t oldestTime = 0;
-  bool found = false;
-  while (file) {
-    String name = String(file.name());
-    if (name.startsWith("cap_") && name.endsWith(".csv")) {
-      if (!found || file.getLastWrite() < oldestTime) {
-        oldestTime = file.getLastWrite();
-        oldestName = name;
-        found = true;
-      }
-    }
-    file = root.openNextFile();
-  }
-  if (found) {
-    String path = "/" + oldestName;
-    LittleFS.remove(path);
-    Serial.print("Freed space by deleting oldest capture: ");
-    Serial.println(path);
-    return true;
-  }
-  return false;
-}
-
-// Ensures at least MIN_FREE_BYTES is free, deleting oldest captures as needed.
-// Returns how many files were deleted (0 is the common case and is cheap —
-// the expensive directory scan inside deleteOldestCapture() only runs when
-// this actually has work to do).
-int ensureFreeSpace() {
-  size_t total = LittleFS.totalBytes();
-  size_t used  = LittleFS.usedBytes();
-  size_t free  = total - used;
-  int guard = 0; // avoid infinite loop if something's wrong
-  int deleted = 0;
-  while (free < MIN_FREE_BYTES && guard < 50) {
-    if (!deleteOldestCapture()) break; // nothing left to delete
-    used = LittleFS.usedBytes();
-    free = total - used;
-    guard++;
-    deleted++;
-  }
-  return deleted;
-}
-
 void startCaptureFile(uint64_t wallMs) {
   uint32_t t0 = DIAG_FLUSH_TIMING ? millis() : 0;
-  int filesDeleted = ensureFreeSpace();
+  int filesDeleted = ensureFreeSpace(true);
   uint32_t t1 = DIAG_FLUSH_TIMING ? millis() : 0;
 
   if (timeSynced) {
@@ -431,7 +630,9 @@ void startCaptureFile(uint64_t wallMs) {
   uint32_t t2 = DIAG_FLUSH_TIMING ? millis() : 0;
   uint32_t t3 = t2;
   if (captureFile) {
-    captureFile.println("timestamp,voltage_mV,current_mA,power_mW,active");
+    resetCaptureSpaceTracking();
+    capIndexPushBack(captureFilename + 1); // +1 skips the leading slash
+    capBytesThisCapture += captureFile.println("timestamp,voltage_mV,current_mA,power_mW,active");
     t3 = DIAG_FLUSH_TIMING ? millis() : 0; // a brand-new file's first write can itself trigger a block
                                             // allocation/erase that open() alone doesn't show — see below
     samplesSinceFlush = 0;
@@ -442,11 +643,12 @@ void startCaptureFile(uint64_t wallMs) {
   if (DIAG_FLUSH_TIMING) {
     char tsBuf[32];
     formatTimestamp(wallMs, tsBuf, sizeof(tsBuf));
-    char diagLine[180];
+    char diagLine[220];
     snprintf(diagLine, sizeof(diagLine),
-             "%s,open,ensureFreeSpace_ms=%lu,deleted=%d,open_ms=%lu,header_write_ms=%lu,total_ms=%lu",
+             "%s,open,ensureFreeSpace_ms=%lu,deleted=%d,open_ms=%lu,header_write_ms=%lu,total_ms=%lu,files=%u,fs_free_est_kb=%u",
              tsBuf, (unsigned long)(t1 - t0), filesDeleted, (unsigned long)(t2 - t1),
-             (unsigned long)(t3 - t2), (unsigned long)(t3 - t0));
+             (unsigned long)(t3 - t2), (unsigned long)(t3 - t0),
+             (unsigned)capCount, (unsigned)(fsFreeEstimate() / 1024));
     Serial.println(diagLine);
     diagLog(diagLine);
   }
@@ -457,7 +659,10 @@ void startCaptureFile(uint64_t wallMs) {
 // than one sample interval, which previously went unaccounted for — e.g.
 // a brand-new file's very first write can trigger its own block
 // allocation/erase that LittleFS.open() alone doesn't incur.
-const uint32_t SLOW_WRITE_THRESHOLD_MS = 15;
+// Raised from 15 to 40 ms: at 20 Hz a stall only costs a sample once it
+// approaches the 50 ms interval, and the normal LittleFS cache commit
+// (~16-20 ms, every few seconds) is no longer worth a log row.
+const uint32_t SLOW_WRITE_THRESHOLD_MS = 40;
 
 // activeFlag goes in the CSV's "active" column: 1 for a sample taken while
 // genuinely in the active state, 0 for pre-roll/post-roll context rows
@@ -465,7 +670,8 @@ const uint32_t SLOW_WRITE_THRESHOLD_MS = 15;
 void writeSampleToCapture(const char* timestamp, float voltage_mV, float current_mA, float power_mW, bool activeFlag) {
   if (!captureFile) return;
   uint32_t tw0 = DIAG_FLUSH_TIMING ? millis() : 0;
-  captureFile.printf("%s,%.1f,%.3f,%.3f,%d\n", timestamp, voltage_mV, current_mA, power_mW, activeFlag ? 1 : 0);
+  size_t wrote = captureFile.printf("%s,%.1f,%.3f,%.3f,%d\n", timestamp, voltage_mV, current_mA, power_mW, activeFlag ? 1 : 0);
+  capBytesThisCapture += wrote;
   if (DIAG_FLUSH_TIMING) {
     uint32_t writeMs = millis() - tw0;
     if (writeMs > SLOW_WRITE_THRESHOLD_MS) {
@@ -475,6 +681,14 @@ void writeSampleToCapture(const char* timestamp, float voltage_mV, float current
       diagLog(diagLine);
     }
   }
+  // "Something extreme" #1: this capture is eating into the last of the free
+  // space (it's far bigger than any recent one) — purge old captures now
+  // rather than let writes start failing.
+  if (fsFreeNetOfOpenCapture() < EXTREME_LOW_FREE_BYTES) extremeSpaceGuard(timestamp);
+
+  // "Something extreme" #2: a single capture has been open a very long time —
+  // flush so the data at risk from a power loss stays bounded. (Normal
+  // captures close long before this and are committed by the close.)
   samplesSinceFlush++;
   if (samplesSinceFlush >= FLUSH_EVERY_N_SAMPLES) {
     uint32_t t0 = DIAG_FLUSH_TIMING ? millis() : 0;
@@ -519,13 +733,33 @@ void writePrerollToCapture() {
 }
 
 void closeCaptureFile() {
+  uint32_t c0 = DIAG_FLUSH_TIMING ? millis() : 0;
+  size_t savedBytes = 0;
   if (captureFile) {
     captureFile.flush();
+    savedBytes = captureFile.size();
     captureFile.close();
     Serial.print("Capture saved: ");
     Serial.println(captureFilename);
+    registerClosedCapture(captureFilename + 1, savedBytes);
   }
-  ensureFreeSpace();
+  // The device is idle now (the 60s sleep grace has just run out): this is
+  // where old data gets cleaned out, so the NEXT capture finds room waiting.
+  uint32_t resyncMs = storageResyncIfDue();
+  int filesDeleted = ensureFreeSpace(false);
+  if (DIAG_FLUSH_TIMING) {
+    char tsBuf[32];
+    formatTimestamp(epochMillis(), tsBuf, sizeof(tsBuf));
+    char diagLine[240];
+    snprintf(diagLine, sizeof(diagLine),
+             "%s,close,saved_bytes=%u,deleted=%d,resync_ms=%lu,cleanup_total_ms=%lu,files=%u,fs_free_est_kb=%u,free_target_kb=%u",
+             tsBuf, (unsigned)savedBytes, filesDeleted, (unsigned long)resyncMs,
+             (unsigned long)(millis() - c0), (unsigned)capCount, (unsigned)(fsFreeEstimate() / 1024),
+             (unsigned)(cleanupTargetBytes() / 1024));
+    Serial.println(diagLine);
+    diagLog(diagLine);
+    diagFlushToFlash(); // idle, so this is the safe moment to touch flash for diagnostics
+  }
 }
 
 // ---- HTTP handlers ----
@@ -565,13 +799,34 @@ void handleDelete() {
   if (!httpServer.hasArg("file")) { httpServer.send(400, "text/plain", "missing file param"); return; }
   String path = "/" + httpServer.arg("file");
   if (!LittleFS.exists(path)) { httpServer.send(404, "text/plain", "not found"); return; }
-  LittleFS.remove(path);
+  size_t sz = 0;
+  File f = LittleFS.open(path, "r");
+  if (f) { sz = f.size(); f.close(); }
+  if (LittleFS.remove(path)) {
+    size_t freed = fsBlockRound(sz);
+    fsUsedEstimate = (fsUsedEstimate > freed) ? fsUsedEstimate - freed : 0;
+  }
   httpServer.send(200, "text/plain", "deleted");
 }
 
 void handleOptions() {
   addCorsHeaders();
   httpServer.send(204);
+}
+
+const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    default:                return "other";
+  }
 }
 
 void setup() {
@@ -610,7 +865,13 @@ void setup() {
   if (!LittleFS.begin(true)) { // true = format on mount failure
     Serial.println("ERROR: LittleFS mount failed");
   } else {
-    Serial.printf("LittleFS ready: %u / %u bytes used\n", LittleFS.usedBytes(), LittleFS.totalBytes());
+    uint32_t idxStart = millis();
+    fsTotalBytes = LittleFS.totalBytes();
+    fsUsedEstimate = LittleFS.usedBytes(); // the one exact read; from here on it's tracked incrementally
+    loadCaptureIndex();
+    bootIndexMs = millis() - idxStart;
+    Serial.printf("LittleFS ready: %u / %u bytes used, %u captures indexed in %lu ms\n",
+                  (unsigned)fsUsedEstimate, (unsigned)fsTotalBytes, (unsigned)capCount, (unsigned long)bootIndexMs);
   }
 
   WiFi.mode(WIFI_STA);
@@ -658,6 +919,21 @@ void setup() {
     Serial.println("WARNING: NTP sync failed — capture filenames and timestamps will fall back to milliseconds-since-boot.");
   }
 
+  if (DIAG_FLUSH_TIMING) {
+    // One row per boot, including why the chip reset — so unexpected reboots
+    // (watchdog, brownout, panic) show up in the log instead of only as
+    // mysteriously fragmented captures.
+    char bootTs[32];
+    formatTimestamp(epochMillis(), bootTs, sizeof(bootTs));
+    char bootLine[220];
+    snprintf(bootLine, sizeof(bootLine), "%s,boot,reset=%s,files=%u,fs_used_kb=%u,fs_total_kb=%u,index_ms=%lu",
+             bootTs, resetReasonName(esp_reset_reason()), (unsigned)capCount,
+             (unsigned)(fsUsedEstimate / 1024), (unsigned)(fsTotalBytes / 1024), (unsigned long)bootIndexMs);
+    Serial.println(bootLine);
+    diagLog(bootLine);
+    diagFlushToFlash();
+  }
+
   if (MDNS.begin(MDNS_HOSTNAME)) {
     Serial.print("mDNS responder started — reachable at ");
     Serial.print(MDNS_HOSTNAME);
@@ -693,14 +969,15 @@ void loop() {
   formatTimestamp(wallMs, tsBuf, sizeof(tsBuf));
 
   float busVoltage_V  = ina226.getBusVoltage_V();
-  float current_mA    = ina226.getCurrent_mA();
+  float rawCurrent_mA = ina226.getCurrent_mA();
+  float current_mA    = (CLIP_NEGATIVE_CURRENT && rawCurrent_mA < 0) ? 0.0f : rawCurrent_mA;
   float power_mW      = busVoltage_V * current_mA; // more stable than getPower_mW() derived value at low currents
   float voltage_mV    = busVoltage_V * 1000.0;
 
   if (SENSOR_DEBUG_SERIAL && (now - lastSensorDebugMs >= 1000)) {
     lastSensorDebugMs = now;
     Serial.printf("INA226 bus=%.3fV shunt=%.4fmV current=%.3fmA\n",
-                  busVoltage_V, ina226.getShuntVoltage_mV(), current_mA);
+                  busVoltage_V, ina226.getShuntVoltage_mV(), rawCurrent_mA);
   }
 
   // Always record into the pre-roll ring buffer first, whatever the capture
